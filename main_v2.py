@@ -23,6 +23,7 @@ from sentence_transformers import SentenceTransformer
 import timm
 from PIL import Image
 
+
 # ==========================
 # 0. Paths and data loading
 # ==========================
@@ -95,6 +96,7 @@ photo_hist = Counter(vals)
 for k, v in sorted(photo_hist.items()):
     print(k, "photos ->", v)
 
+
 # ==========================
 # 1. Text embeddings (MiniLM)
 # ==========================
@@ -118,6 +120,7 @@ test_text_emb = model_text.encode(
 print("\nПеревірка 10.1: Перевірка embedding")
 print(train_text_emb.shape)
 print(test_text_emb.shape)
+
 
 # ==========================
 # 2. Image embeddings (EfficientNet-B0)
@@ -193,6 +196,7 @@ test_img_emb  = np.stack(test_img_emb_list)
 print("Train image emb shape:", train_img_emb.shape)
 print("Test image emb shape:", test_img_emb.shape)
 
+
 # ==========================
 # 3. TF-IDF text features
 # ==========================
@@ -210,6 +214,7 @@ tfidf_train = tfidf_train.astype(np.float32)
 tfidf_test  = tfidf_test.astype(np.float32)
 
 print("TF-IDF shapes:", tfidf_train.shape, tfidf_test.shape)
+
 
 # ==========================
 # 4. Color histograms (R,G,B)
@@ -251,6 +256,7 @@ test_color  = np.stack(test_color_list)
 
 print("Color hist shapes:", train_color.shape, test_color.shape)
 
+
 # ==========================
 # 5. Simple tabular features
 # ==========================
@@ -277,6 +283,7 @@ print("Train photo count stats:",
       np.mean(train_photo_cnt),
       np.max(train_photo_cnt))
 
+
 # ==========================
 # 6. Optional PCA (to keep size reasonable)
 # ==========================
@@ -294,6 +301,7 @@ test_text_emb_pca  = pca_text.transform(test_text_emb)
 
 print("PCA image:", train_img_emb_pca.shape, test_img_emb_pca.shape)
 print("PCA text :", train_text_emb_pca.shape, test_text_emb_pca.shape)
+
 
 # ==========================
 # 7. Final feature matrix
@@ -333,6 +341,7 @@ print("X_train shape:", X_train.shape)
 print("X_test shape:", X_test.shape)
 print("y_train shape:", y_train.shape)
 
+
 # ==========================
 # 8. Train/validation split
 # ==========================
@@ -347,6 +356,7 @@ X_tr, X_val, y_tr, y_val = train_test_split(
 
 print("Train split:", X_tr.shape, y_tr.shape)
 print("Val split  :", X_val.shape, y_val.shape)
+
 
 # ==========================
 # 9. QWK + threshold optimizer (Nelder–Mead)
@@ -383,6 +393,7 @@ def optimize_thresholds(y_true, preds):
     best_thr = np.sort(result.x)
     best_kappa = -result.fun
     return best_thr, best_kappa
+
 
 # ==========================
 # 10. Optuna for CatBoost
@@ -435,6 +446,7 @@ best_thr_cb, best_kappa_cb = optimize_thresholds(y_val, val_preds_cb)
 print("CatBoost thresholds:", best_thr_cb)
 print("CatBoost val QWK  :", best_kappa_cb)
 
+
 # ==========================
 # 11. LightGBM model
 # ==========================
@@ -454,17 +466,18 @@ lgb_params = {
     "seed": 42,
 }
 
+callbacks = [lgb.early_stopping(stopping_rounds=100)]
+
 model_lgb = lgb.train(
     lgb_params,
     lgb_train,
     num_boost_round=1000,
-    valid_sets=[lgb_train, lgb_val],
-    valid_names=["train", "val"],
-    early_stopping_rounds=100,
-    verbose_eval=100
+    valid_sets=[lgb_val],
+    valid_names=["val"]
 )
 
 val_preds_lgb = model_lgb.predict(X_val, num_iteration=model_lgb.best_iteration)
+
 
 # ==========================
 # 12. Ensemble (CatBoost + LightGBM)
@@ -475,6 +488,7 @@ best_thr_ens, best_kappa_ens = optimize_thresholds(y_val, val_preds_ensemble)
 
 print("Ensemble thresholds:", best_thr_ens)
 print("Ensemble val QWK  :", best_kappa_ens)
+
 
 # ==========================
 # 13. Final training on all train
@@ -492,6 +506,7 @@ final_lgb = lgb.train(
     num_boost_round=model_lgb.best_iteration or 1000,
     verbose_eval=False
 )
+
 
 # ==========================
 # 14. Predictions for test + submission
