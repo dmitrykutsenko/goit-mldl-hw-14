@@ -3,7 +3,6 @@ import re
 import gc
 import time
 import random
-import shutil
 from pathlib import Path
 from collections import Counter
 
@@ -11,7 +10,6 @@ import numpy as np
 import pandas as pd
 
 import torch
-import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import timm
@@ -33,20 +31,21 @@ import optuna
 # Config
 # =========================
 
-DATA_DIR = "./data/petfinder/"
+DATA_DIR = "C:/Goit/goit-mldl-hw-14/data/petfinder/"
 TRAIN_CSV = os.path.join(DATA_DIR, "train.csv")
 TEST_CSV = os.path.join(DATA_DIR, "test.csv")
-TRAIN_IMG_DIR = os.path.join(DATA_DIR, "images/images/train")
-TEST_IMG_DIR = os.path.join(DATA_DIR, "images/images/test")
+
+TRAIN_IMG_DIR = "./data/petfinder/images/images/train"
+TEST_IMG_DIR  = "./data/petfinder/images/images/test"
 
 TEXT_EMB_MODEL_NAME = "all-MiniLM-L6-v2"
 IMAGE_MODEL_NAME = "efficientnet_b0"
 
 IMAGE_SIZE = 224
-BATCH_SIZE_IMG = 64
+BATCH_SIZE_IMG = 32   # safe for MX550
 
 TFIDF_MAX_FEATURES = 500
-COLOR_BINS = 32  # per channel → 32*3 = 96
+COLOR_BINS = 32
 
 PCA_IMG_DIM = 192
 PCA_TXT_DIM = 96
@@ -78,36 +77,24 @@ def clean_text(text):
     return text.strip()
 
 def quadratic_weighted_kappa(y_true, y_pred):
-    """
-    y_true, y_pred: integer labels 0..N or 1..N
-    We'll map to 0..3 internally.
-    """
-    y_true = np.array(y_true, dtype=int)
-    y_pred = np.array(y_pred, dtype=int)
     return cohen_kappa_score(y_true, y_pred, weights="quadratic")
 
 def optimize_thresholds(y_true, y_pred_cont):
-    """
-    Simple 3-threshold optimization for 4 classes (0..3 or 1..4).
-    We assume target labels are 1..4 in PetFinder.
-    """
     y_true = np.array(y_true, dtype=int)
     y_pred_cont = np.array(y_pred_cont, dtype=float)
 
-    # Start from percentiles
     qs = np.percentile(y_pred_cont, [25, 50, 75])
     best_t = qs.copy()
     best_kappa = -1.0
 
-    # Small random search around initial thresholds
-    for _ in range(200):
+    for _ in range(300):
         t1 = best_t[0] + np.random.uniform(-0.3, 0.3)
         t2 = best_t[1] + np.random.uniform(-0.3, 0.3)
         t3 = best_t[2] + np.random.uniform(-0.3, 0.3)
         if not (t1 < t2 < t3):
             continue
 
-        y_pred_cls = np.digitize(y_pred_cont, [t1, t2, t3]) + 1  # classes 1..4
+        y_pred_cls = np.digitize(y_pred_cont, [t1, t2, t3]) + 1
         kappa = quadratic_weighted_kappa(y_true, y_pred_cls)
         if kappa > best_kappa:
             best_kappa = kappa
@@ -119,63 +106,26 @@ def optimize_thresholds(y_true, y_pred_cont):
 # Load data
 # =========================
 
-print("Train dir exists:", os.path.exists(TRAIN_IMG_DIR))
-print("Test dir exists:", os.path.exists(TEST_IMG_DIR))
-
 train = pd.read_csv(TRAIN_CSV)
 test = pd.read_csv(TEST_CSV)
 
-print("\nПеревірка 1: Загальна інформація")
-print("TRAIN:", train.shape)
-print("TEST :", test.shape)
-
-print("\nColumns:")
-print(train.columns.tolist())
-
-print("\nПеревірка 2: Типи колонок")
-print(train.dtypes)
-
-print("\nПеревірка 3: Пропуски")
-na = train.isnull().sum()
-print(na[na > 0].sort_values(ascending=False))
-
-print("\nПеревірка 4: Цільова змінна")
-print(train["AdoptionSpeed"].value_counts().sort_index())
-
 train["Description"] = train["Description"].fillna("").apply(clean_text)
 test["Description"] = test["Description"].fillna("").apply(clean_text)
-
-print("\nПеревірка 7: Довжина текстів")
-desc_len = train["Description"].str.len()
-print(desc_len.describe())
 
 # =========================
 # Photo stats
 # =========================
 
-print("\nПеревірка 8: Кількість фотографій")
 train_counts = Counter()
 for f in os.listdir(TRAIN_IMG_DIR):
     if f.endswith(".jpg"):
         pet_id = f.split("-")[0]
         train_counts[pet_id] += 1
 
-vals = list(train_counts.values())
-print("Min:", min(vals))
-print("Mean:", np.mean(vals))
-print("Max:", max(vals))
-print("Median:", np.median(vals))
-
-print("\nПеревірка 9: Розподіл фото")
-photo_hist = Counter(vals)
-for k, v in sorted(photo_hist.items()):
-    print(k, "photos ->", v)
-
 # =========================
 # SentenceTransformer embeddings
 # =========================
 
-print("\nЗавантаження SentenceTransformer (MiniLM)...")
 model_text = SentenceTransformer(TEXT_EMB_MODEL_NAME)
 
 train_text_emb = model_text.encode(
@@ -191,16 +141,11 @@ test_text_emb = model_text.encode(
     convert_to_numpy=True
 )
 
-print("\nПеревірка 10.1: Перевірка embedding")
-print(train_text_emb.shape)
-print(test_text_emb.shape)
-
 # =========================
-# Image embeddings
+# Image embeddings (3 photos)
 # =========================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print("Using device:", device)
 
 image_model = timm.create_model(
     IMAGE_MODEL_NAME,
@@ -226,22 +171,33 @@ class PetImageDataset(Dataset):
 
     def __getitem__(self, idx):
         pet_id = self.pet_ids[idx]
-        # choose first photo if multiple
-        # filenames: {PetID}-{PhotoNumber}.jpg
-        # we just take "-1.jpg" if exists, else any
-        candidates = []
-        for f in os.listdir(self.img_dir):
-            if f.startswith(pet_id) and f.endswith(".jpg"):
-                candidates.append(f)
+
+        candidates = sorted([
+            f for f in os.listdir(self.img_dir)
+            if f.startswith(pet_id) and f.endswith(".jpg")
+        ])
+
+        # беремо максимум 3 фото
+        candidates = candidates[:3]
+
+        imgs = []
         if len(candidates) == 0:
-            # dummy black image
+            # dummy
             img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (0, 0, 0))
+            imgs = [transform_img(img)] * 3
         else:
-            # take first
-            img_path = os.path.join(self.img_dir, sorted(candidates)[0])
-            img = Image.open(img_path).convert("RGB")
-        img = transform_img(img)
-        return img
+            for fname in candidates:
+                img_path = os.path.join(self.img_dir, fname)
+                img = Image.open(img_path).convert("RGB")
+                imgs.append(transform_img(img))
+
+            # якщо фото менше ніж 3 — дублюємо останнє
+            while len(imgs) < 3:
+                imgs.append(imgs[-1])
+
+        # тепер завжди (3, 3, 224, 224)
+        return torch.stack(imgs, dim=0)
+
 
 def compute_image_embeddings(df, img_dir):
     dataset = PetImageDataset(df, img_dir)
@@ -250,28 +206,24 @@ def compute_image_embeddings(df, img_dir):
     all_emb = []
     with torch.no_grad():
         for batch in loader:
-            batch = batch.to(device)
-            emb = image_model(batch)
-            emb = emb.cpu().numpy()
-            all_emb.append(emb)
-    all_emb = np.concatenate(all_emb, axis=0)
-    return all_emb
+            B, N, C, H, W = batch.shape
+            batch = batch.view(B*N, C, H, W).to(device)
 
-print("\nОбчислення image embeddings...")
-print("Train image index size:", len(train))
-print("Test image index size:", len(test))
+            emb = image_model(batch)
+            emb = emb.view(B, N, -1)
+            emb = emb.mean(dim=1)
+
+            all_emb.append(emb.cpu().numpy())
+
+    return np.concatenate(all_emb, axis=0)
 
 train_img_emb = compute_image_embeddings(train, TRAIN_IMG_DIR)
-test_img_emb = compute_image_embeddings(test, TEST_IMG_DIR)
-
-print("Train image emb shape:", train_img_emb.shape)
-print("Test image emb shape:", test_img_emb.shape)
+test_img_emb  = compute_image_embeddings(test, TEST_IMG_DIR)
 
 # =========================
 # TF-IDF
 # =========================
 
-print("\nОбчислення TF-IDF...")
 tfidf = TfidfVectorizer(
     max_features=TFIDF_MAX_FEATURES,
     ngram_range=(1, 2),
@@ -280,8 +232,6 @@ tfidf = TfidfVectorizer(
 tfidf_train = tfidf.fit_transform(train["Description"].tolist()).toarray()
 tfidf_test = tfidf.transform(test["Description"].tolist()).toarray()
 
-print("TF-IDF shapes:", tfidf_train.shape, tfidf_test.shape)
-
 # =========================
 # Color histograms
 # =========================
@@ -289,75 +239,51 @@ print("TF-IDF shapes:", tfidf_train.shape, tfidf_test.shape)
 def compute_color_histograms(df, img_dir, bins=COLOR_BINS):
     hist_list = []
     for pet_id in df["PetID"].tolist():
-        candidates = []
-        for f in os.listdir(img_dir):
-            if f.startswith(pet_id) and f.endswith(".jpg"):
-                candidates.append(f)
+        candidates = sorted([
+            f for f in os.listdir(img_dir)
+            if f.startswith(pet_id) and f.endswith(".jpg")
+        ])
         if len(candidates) == 0:
             img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (0, 0, 0))
         else:
-            img_path = os.path.join(img_dir, sorted(candidates)[0])
+            img_path = os.path.join(img_dir, candidates[0])
             img = Image.open(img_path).convert("RGB")
+
         img_np = np.array(img)
-        # per-channel hist
         hists = []
         for c in range(3):
             channel = img_np[:, :, c].flatten()
             hist, _ = np.histogram(channel, bins=bins, range=(0, 255), density=True)
             hists.append(hist)
-        hists = np.concatenate(hists)
-        hist_list.append(hists)
+        hist_list.append(np.concatenate(hists))
+
     return np.array(hist_list)
 
-print("\nОбчислення color histograms...")
-train_color = compute_color_histograms(train, TRAIN_IMG_DIR, bins=COLOR_BINS)
-test_color = compute_color_histograms(test, TEST_IMG_DIR, bins=COLOR_BINS)
-
-print("Train color hist:", train_color.shape[0])
-print("Test color hist:", test_color.shape[0])
-print("Color hist shapes:", train_color.shape, test_color.shape)
+train_color = compute_color_histograms(train, TRAIN_IMG_DIR)
+test_color  = compute_color_histograms(test, TEST_IMG_DIR)
 
 # =========================
 # Photo count feature
 # =========================
 
-photo_count_map = train_counts  # Counter from earlier
+def get_photo_counts(df, counter_map):
+    return np.array([counter_map.get(pid, 0) for pid in df["PetID"]]).reshape(-1, 1)
 
-def get_photo_counts(df, img_dir, counter_map):
-    counts = []
-    for pet_id in df["PetID"].tolist():
-        c = counter_map.get(pet_id, 0)
-        if c == 0:
-            # count files directly
-            c = 0
-            for f in os.listdir(img_dir):
-                if f.startswith(pet_id) and f.endswith(".jpg"):
-                    c += 1
-        counts.append(c)
-    return np.array(counts).reshape(-1, 1)
-
-train_photo_counts = get_photo_counts(train, TRAIN_IMG_DIR, photo_count_map)
-test_photo_counts = get_photo_counts(test, TEST_IMG_DIR, photo_count_map)
-
-print("\nTrain photo count stats:")
-print(train_photo_counts.min(), train_photo_counts.mean(), train_photo_counts.max())
+train_photo_counts = get_photo_counts(train, train_counts)
+test_photo_counts  = get_photo_counts(test, train_counts)
 
 # =========================
-# PCA for image/text embeddings
+# PCA
 # =========================
 
-print("\nPCA для image/text...")
 pca_img = PCA(n_components=PCA_IMG_DIM, random_state=RANDOM_SEED)
 pca_txt = PCA(n_components=PCA_TXT_DIM, random_state=RANDOM_SEED)
 
 train_img_pca = pca_img.fit_transform(train_img_emb)
-test_img_pca = pca_img.transform(test_img_emb)
+test_img_pca  = pca_img.transform(test_img_emb)
 
 train_txt_pca = pca_txt.fit_transform(train_text_emb)
-test_txt_pca = pca_txt.transform(test_text_emb)
-
-print("PCA image:", train_img_pca.shape, test_img_pca.shape)
-print("PCA text :", train_txt_pca.shape, test_txt_pca.shape)
+test_txt_pca  = pca_txt.transform(test_text_emb)
 
 # =========================
 # Final feature matrix
@@ -374,12 +300,6 @@ X_test = np.concatenate(
 
 y_train = train["AdoptionSpeed"].values.astype(int)
 
-print("X_train shape:", X_train.shape)
-print("X_test shape:", X_test.shape)
-print("y_train shape:", y_train.shape)
-
-# Map labels to 1..4 (already so), but keep as is.
-
 # =========================
 # Train/val split
 # =========================
@@ -391,11 +311,8 @@ X_tr, X_val, y_tr, y_val = train_test_split(
     stratify=y_train
 )
 
-print("Train split:", X_tr.shape, y_tr.shape)
-print("Val split  :", X_val.shape, y_val.shape)
-
 # =========================
-# Optuna + CatBoost (CPU)
+# Optuna + CatBoost
 # =========================
 
 def objective(trial):
@@ -422,18 +339,13 @@ def objective(trial):
     thresholds, kappa = optimize_thresholds(y_val, val_pred_cont)
     return kappa
 
-print("\nRunning Optuna for CatBoost (це може зайняти час)...")
 study = optuna.create_study(direction="maximize")
 study.optimize(objective, n_trials=N_OPTUNA_TRIALS)
 
 best_params = study.best_params
-best_val_qwk = study.best_value
-
-print("Best CatBoost params:", best_params)
-print("Best CatBoost val QWK:", best_val_qwk)
 
 # =========================
-# Train final CatBoost on full train
+# Final CatBoost
 # =========================
 
 final_cat = CatBoostRegressor(
@@ -450,18 +362,12 @@ final_cat = CatBoostRegressor(
 
 final_cat.fit(X_train, y_train, verbose=False)
 
-# thresholds from val again (for CatBoost-only)
 val_pred_cat = final_cat.predict(X_val)
 cat_thresholds, cat_val_qwk = optimize_thresholds(y_val, val_pred_cat)
 
-print("CatBoost thresholds:", cat_thresholds)
-print("CatBoost val QWK  :", cat_val_qwk)
-
 # =========================
-# LightGBM (LGBMRegressor) on full train
+# LightGBM (safe version)
 # =========================
-
-print("\nTraining LightGBM (LGBMRegressor)...")
 
 model_lgb = lgb.LGBMRegressor(
     objective="regression",
@@ -474,16 +380,8 @@ model_lgb = lgb.LGBMRegressor(
     n_estimators=600
 )
 
-# тренуємо на train/val, щоб мати адекватні предикти для ансамблю
-model_lgb.fit(
-    X_tr, y_tr,
-    eval_set=[(X_val, y_val)]
-)
+model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
 
-# якщо best_iteration_ є — можемо використати, але не обов'язково
-best_n_estimators = getattr(model_lgb, "best_iteration_", 600)
-
-# Фінальна модель — теж 600 дерев
 final_lgb = lgb.LGBMRegressor(
     objective="regression",
     learning_rate=0.05,
@@ -495,35 +393,19 @@ final_lgb = lgb.LGBMRegressor(
     n_estimators=600
 )
 
-# БЕЗ verbose
 final_lgb.fit(X_train, y_train)
 
-
 # =========================
-# Ensemble on validation
+# Ensemble
 # =========================
 
-# CatBoost validation predictions
-val_pred_cat = final_cat.predict(X_val)
-
-# LightGBM validation predictions
 val_pred_lgb = final_lgb.predict(X_val)
-
-# Ensemble (CatBoost + LightGBM)
 val_pred_ens = 0.5 * val_pred_cat + 0.5 * val_pred_lgb
 
-# Optimize thresholds on ensemble
 ens_thresholds, ens_val_qwk = optimize_thresholds(y_val, val_pred_ens)
 
-print("Ensemble thresholds:", ens_thresholds)
-print("Ensemble val QWK  :", ens_val_qwk)
-
 # =========================
-# Final training (CatBoost + LGBM already on full train)
-# =========================
-
-# =========================
-# Predictions for test + submission
+# Test predictions
 # =========================
 
 test_pred_cat = final_cat.predict(X_test)
@@ -531,9 +413,8 @@ test_pred_lgb = final_lgb.predict(X_test)
 
 test_pred_ens = 0.5 * test_pred_cat + 0.5 * test_pred_lgb
 
-# Use ensemble thresholds
 t1, t2, t3 = ens_thresholds
-test_cls = np.digitize(test_pred_ens, [t1, t2, t3]) + 1  # 1..4
+test_cls = np.digitize(test_pred_ens, [t1, t2, t3]) + 1
 
 submission = pd.DataFrame({
     "PetID": test["PetID"],
@@ -541,5 +422,5 @@ submission = pd.DataFrame({
 })
 
 submission.to_csv(SUBMISSION_PATH, index=False)
-print(f"Saved submission to: {SUBMISSION_PATH}")
+print("Saved submission:", SUBMISSION_PATH)
 print(submission.head())

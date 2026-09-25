@@ -171,6 +171,29 @@ photo_hist = Counter(vals)
 for k, v in sorted(photo_hist.items()):
     print(k, "photos ->", v)
 
+def __getitem__(self, idx):
+    pet_id = self.pet_ids[idx]
+
+    candidates = sorted([
+        f for f in os.listdir(self.img_dir)
+        if f.startswith(pet_id) and f.endswith(".jpg")
+    ])
+
+    candidates = candidates[:3]  # беремо максимум 3 фото
+
+    imgs = []
+    if len(candidates) == 0:
+        img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (0, 0, 0))
+        imgs.append(transform_img(img))
+    else:
+        for fname in candidates:
+            img_path = os.path.join(self.img_dir, fname)
+            img = Image.open(img_path).convert("RGB")
+            imgs.append(transform_img(img))
+
+    return torch.stack(imgs, dim=0)  # (N, 3, 224, 224)
+
+
 # =========================
 # SentenceTransformer embeddings
 # =========================
@@ -248,12 +271,22 @@ def compute_image_embeddings(df, img_dir):
     loader = DataLoader(dataset, batch_size=BATCH_SIZE_IMG, shuffle=False)
 
     all_emb = []
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            emb = image_model(batch)
-            emb = emb.cpu().numpy()
-            all_emb.append(emb)
+    for batch in loader:
+        B, N, C, H, W = batch.shape
+        batch = batch.view(B*N, C, H, W).to(device)
+
+        emb = image_model(batch)  # (B*N, 1280)
+        emb = emb.view(B, N, -1)  # (B, N, 1280)
+
+        emb = emb.mean(dim=1)     # (B, 1280)
+        all_emb.append(emb.cpu().numpy())
+
+    #with torch.no_grad():
+    #    for batch in loader:
+    #        batch = batch.to(device)
+    #        emb = image_model(batch)
+    #        emb = emb.cpu().numpy()
+    #        all_emb.append(emb)
     all_emb = np.concatenate(all_emb, axis=0)
     return all_emb
 
