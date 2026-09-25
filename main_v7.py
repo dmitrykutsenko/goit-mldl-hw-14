@@ -25,7 +25,6 @@ from sklearn.metrics import cohen_kappa_score
 
 from catboost import CatBoostRegressor
 import lightgbm as lgb
-import optuna
 
 # =========================
 # Config
@@ -142,7 +141,7 @@ test_text_emb = model_text.encode(
 )
 
 # =========================
-# Image embeddings (3 photos)
+# Image embeddings (3 photos per pet)
 # =========================
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -177,12 +176,10 @@ class PetImageDataset(Dataset):
             if f.startswith(pet_id) and f.endswith(".jpg")
         ])
 
-        # беремо максимум 3 фото
         candidates = candidates[:3]
 
         imgs = []
         if len(candidates) == 0:
-            # dummy
             img = Image.new("RGB", (IMAGE_SIZE, IMAGE_SIZE), (0, 0, 0))
             imgs = [transform_img(img)] * 3
         else:
@@ -191,11 +188,9 @@ class PetImageDataset(Dataset):
                 img = Image.open(img_path).convert("RGB")
                 imgs.append(transform_img(img))
 
-            # якщо фото менше ніж 3 — дублюємо останнє
             while len(imgs) < 3:
                 imgs.append(imgs[-1])
 
-        # тепер завжди (3, 3, 224, 224)
         return torch.stack(imgs, dim=0)
 
 
@@ -207,7 +202,7 @@ def compute_image_embeddings(df, img_dir):
     with torch.no_grad():
         for batch in loader:
             B, N, C, H, W = batch.shape
-            batch = batch.view(B*N, C, H, W).to(device)
+            batch = batch.view(B * N, C, H, W).to(device)
 
             emb = image_model(batch)
             emb = emb.view(B, N, -1)
@@ -301,7 +296,7 @@ X_test = np.concatenate(
 y_train = train["AdoptionSpeed"].values.astype(int)
 
 # =========================
-# Train/val split
+# Train/val split (for thresholds & QWK)
 # =========================
 
 X_tr, X_val, y_tr, y_val = train_test_split(
@@ -312,7 +307,7 @@ X_tr, X_val, y_tr, y_val = train_test_split(
 )
 
 # =========================
-# Optuna + CatBoost
+# Optuna + CatBoost (on split)
 # =========================
 
 def objective(trial):
@@ -339,13 +334,14 @@ def objective(trial):
     thresholds, kappa = optimize_thresholds(y_val, val_pred_cont)
     return kappa
 
+import optuna
 study = optuna.create_study(direction="maximize")
 study.optimize(objective, n_trials=N_OPTUNA_TRIALS)
 
 best_params = study.best_params
 
 # =========================
-# Final CatBoost
+# Final CatBoost (on full train)
 # =========================
 
 final_cat = CatBoostRegressor(
@@ -362,25 +358,9 @@ final_cat = CatBoostRegressor(
 
 final_cat.fit(X_train, y_train, verbose=False)
 
-val_pred_cat = final_cat.predict(X_val)
-cat_thresholds, cat_val_qwk = optimize_thresholds(y_val, val_pred_cat)
-
 # =========================
-# LightGBM (safe version)
+# LightGBM (on full train)
 # =========================
-
-model_lgb = lgb.LGBMRegressor(
-    objective="regression",
-    learning_rate=0.05,
-    num_leaves=64,
-    feature_fraction=0.8,
-    bagging_fraction=0.8,
-    bagging_freq=1,
-    random_state=RANDOM_SEED,
-    n_estimators=600
-)
-
-model_lgb.fit(X_tr, y_tr, eval_set=[(X_val, y_val)])
 
 final_lgb = lgb.LGBMRegressor(
     objective="regression",
@@ -396,10 +376,9 @@ final_lgb = lgb.LGBMRegressor(
 final_lgb.fit(X_train, y_train)
 
 # =========================
-# Threshold optimization WITHOUT leakage
+# Threshold optimization WITHOUT leakage (use train split)
 # =========================
 
-# 1. Optimize thresholds on TRAIN split (safe)
 train_pred_cat = final_cat.predict(X_tr)
 cat_thr, _ = optimize_thresholds(y_tr, train_pred_cat)
 
@@ -409,111 +388,40 @@ lgb_thr, _ = optimize_thresholds(y_tr, train_pred_lgb)
 train_pred_ens = 0.5 * train_pred_cat + 0.5 * train_pred_lgb
 ens_thr, _ = optimize_thresholds(y_tr, train_pred_ens)
 
-
 # =========================
 # Evaluate on VAL split (real QWK)
 # =========================
 
-# CatBoost
 val_pred_cat = final_cat.predict(X_val)
 val_cat_cls = np.digitize(val_pred_cat, cat_thr) + 1
 cat_val_qwk = quadratic_weighted_kappa(y_val, val_cat_cls)
 print("CatBoost val QWK (real):", cat_val_qwk)
 
-# LightGBM
 val_pred_lgb = final_lgb.predict(X_val)
 val_lgb_cls = np.digitize(val_pred_lgb, lgb_thr) + 1
 lgb_val_qwk = quadratic_weighted_kappa(y_val, val_lgb_cls)
 print("LightGBM val QWK (real):", lgb_val_qwk)
 
-# Ensemble
 val_pred_ens = 0.5 * val_pred_cat + 0.5 * val_pred_lgb
 val_ens_cls = np.digitize(val_pred_ens, ens_thr) + 1
 ens_val_qwk = quadratic_weighted_kappa(y_val, val_ens_cls)
 print("Ensemble thresholds:", ens_thr)
 print("Ensemble val QWK (real):", ens_val_qwk)
 
-
 # =========================
-# Test predictions
+# Test predictions + submission
 # =========================
 
 test_pred_cat = final_cat.predict(X_test)
 test_pred_lgb = final_lgb.predict(X_test)
-
 test_pred_ens = 0.5 * test_pred_cat + 0.5 * test_pred_lgb
 
-# -----------------------------
-# 1. Оцінка на валі (реальний QWK)
-# -----------------------------
-from sklearn.metrics import cohen_kappa_score
-import numpy as np
+test_ens_cls = np.digitize(test_pred_ens, ens_thr) + 1
 
-# CatBoost: валідні предикти -> класи
-val_cat_pred = cat_model.predict(X_val)
-val_cat_cls = np.digitize(val_cat_pred, cat_thresholds)
-val_cat_qwk_real = cohen_kappa_score(y_val, val_cat_cls, weights="quadratic")
-print(f"CatBoost val QWK (real): {val_cat_qwk_real}")
-
-# LightGBM: валідні предикти -> класи
-val_lgb_pred = final_lgb.predict(X_val)
-val_lgb_cls = np.digitize(val_lgb_pred, lgb_thresholds)
-val_lgb_qwk_real = cohen_kappa_score(y_val, val_lgb_cls, weights="quadratic")
-print(f"LightGBM val QWK (real): {val_lgb_qwk_real}")
-
-# Ensemble: середнє двох моделей -> класи
-val_ens_pred = 0.5 * val_cat_pred + 0.5 * val_lgb_pred
-ens_thresholds, ens_qwk = optimize_thresholds(val_ens_pred, y_val)
-
-print("Ensemble thresholds:", ens_thresholds)
-print(f"Ensemble val QWK (real): {ens_qwk}")
-
-# -----------------------------
-# 2. Інференс на всьому train + test
-# -----------------------------
-# Повторно тренуємо CatBoost на всьому train
-cat_model_full = CatBoostRegressor(
-    depth=best_params["depth"],
-    learning_rate=best_params["learning_rate"],
-    l2_leaf_reg=best_params["l2_leaf_reg"],
-    iterations=best_params["iterations"],
-    loss_function="RMSE",
-    verbose=False,
-    random_seed=42
-)
-cat_model_full.fit(X_train, y_train)
-
-# Повторно тренуємо LightGBM на всьому train
-final_lgb_full = LGBMRegressor(
-    n_estimators=2000,
-    learning_rate=0.03,
-    max_depth=-1,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    reg_alpha=0.0,
-    reg_lambda=0.0,
-    random_state=42,
-    n_jobs=-1
-)
-final_lgb_full.fit(X_train, y_train)
-
-# Предикти на test
-test_cat_pred = cat_model_full.predict(X_test)
-test_lgb_pred = final_lgb_full.predict(X_test)
-test_ens_pred = 0.5 * test_cat_pred + 0.5 * test_lgb_pred
-
-# Використовуємо ens_thresholds для перетворення в класи
-test_ens_cls = np.digitize(test_ens_pred, ens_thresholds)
-
-# -----------------------------
-# 3. Збереження submission
-# -----------------------------
 submission = pd.DataFrame({
     "PetID": test["PetID"].values,
     "AdoptionSpeed": test_ens_cls
 })
-out_path = "C:/Goit/goit-mldl-hw-14/data/petfinder/submission.csv"
-submission.to_csv(out_path, index=False)
-print(f"Saved submission: {out_path}")
+submission.to_csv(SUBMISSION_PATH, index=False)
+print(f"Saved submission: {SUBMISSION_PATH}")
 print(submission.head())
-
