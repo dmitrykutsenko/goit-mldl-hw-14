@@ -404,6 +404,18 @@ val_pred_ens = 0.5 * val_pred_cat + 0.5 * val_pred_lgb
 
 ens_thresholds, ens_val_qwk = optimize_thresholds(y_val, val_pred_ens)
 
+print("CatBoost val QWK:", cat_val_qwk)
+
+val_pred_lgb = final_lgb.predict(X_val)
+lgb_thr, lgb_qwk = optimize_thresholds(y_val, val_pred_lgb)
+print("LightGBM val QWK:", lgb_qwk)
+
+val_pred_ens = 0.5 * val_pred_cat + 0.5 * val_pred_lgb
+ens_thr, ens_qwk = optimize_thresholds(y_val, val_pred_ens)
+print("Ensemble thresholds:", ens_thr)
+print("Ensemble val QWK :", ens_qwk)
+
+
 # =========================
 # Test predictions
 # =========================
